@@ -33,6 +33,13 @@
 #                        into the existing userns namespace root and fix ownership.
 #                        Use this when userns-remap is already active but old
 #                        volume data has not yet been moved to the new root.
+#   COMPOSE_FILE=/path/to/docker-compose.yml
+#                        When set, Compose-managed volumes are registered via
+#                        'docker compose up --no-start' rather than bare
+#                        'docker volume create'.  This ensures Docker Compose
+#                        owns the volume metadata (labels) so that subsequent
+#                        'docker compose up -d' does not complain about volumes
+#                        not created by Compose.
 # ==============================================================================
 
 set -euo pipefail
@@ -47,6 +54,11 @@ BACKUP_DIR="${BACKUP_DIR:-/root/docker-userns-backup-$(date +%Y%m%d-%H%M%S)}"
 DRY_RUN="${DRY_RUN:-false}"
 SKIP_BACKUP="${SKIP_BACKUP:-false}"
 FORCE_MIGRATE="${FORCE_MIGRATE:-false}"
+# Optional path to a docker-compose.yml.  When set, Compose-managed volumes
+# (those with a com.docker.compose.project label) are NOT pre-created with
+# 'docker volume create'; instead, 'docker compose up --no-start' is called
+# after data is in place, letting Compose register the volumes itself.
+COMPOSE_FILE="${COMPOSE_FILE:-}"
 
 # Populated after Docker restarts
 USERNS_OFFSET=""
@@ -528,14 +540,33 @@ migrate_volumes() {
         info "  Migrating: $vol"
         info "    src : $src"
 
-        # Register the volume in the new (userns) namespace so Docker creates
-        # the metadata and the _data directory.
+        # Determine whether this is a Compose-managed volume.
+        # Compose-managed volumes must NOT be pre-created with 'docker volume
+        # create' here — doing so without the exact Compose labels causes
+        # 'docker compose up' to fail with "volume was not created by Compose".
+        # Instead we only create the _data directory; the volume registration
+        # (with correct labels) is done later by register_compose_volumes().
         local labels="${VOLUME_LABELS[$vol]:-}"
-        if [[ "$DRY_RUN" == "true" ]]; then
-            info "    [dry-run] docker volume create ${labels} ${vol}"
+        local is_compose_vol=false
+        if echo "$labels" | grep -q 'com.docker.compose.project'; then
+            is_compose_vol=true
+        fi
+
+        if [[ "$is_compose_vol" == "true" ]]; then
+            # Only ensure the _data directory exists; data will be copied below.
+            # register_compose_volumes() will register the volume in Docker via Compose.
+            if [[ "$DRY_RUN" != "true" ]]; then
+                mkdir -p "${new_root}/${vol}/_data"
+            fi
+            info "    (Compose-managed — skipping docker volume create, will register via Compose later)"
         else
-            # shellcheck disable=SC2086
-            docker volume create ${labels} "$vol" > /dev/null 2>&1 || true
+            # Non-Compose volume: pre-create so Docker tracks the metadata.
+            if [[ "$DRY_RUN" == "true" ]]; then
+                info "    [dry-run] docker volume create ${labels} ${vol}"
+            else
+                # shellcheck disable=SC2086
+                docker volume create ${labels} "$vol" > /dev/null 2>&1 || true
+            fi
         fi
 
         local dst="${new_root}/${vol}/_data"
@@ -577,6 +608,61 @@ migrate_volumes() {
 
         ok "  Done: $vol"
     done
+}
+
+# ===========================================================================
+# PHASE 5b — REGISTER COMPOSE-MANAGED VOLUMES
+# ===========================================================================
+register_compose_volumes() {
+    step "Registering Compose-managed volumes"
+
+    # Collect volumes that are Compose-managed (have the compose project label)
+    local -a compose_vols=()
+    for vol in "${VOLUME_NAMES[@]}"; do
+        if echo "${VOLUME_LABELS[$vol]:-}" | grep -q 'com.docker.compose.project'; then
+            compose_vols+=("$vol")
+        fi
+    done
+
+    if [[ ${#compose_vols[@]} -eq 0 ]]; then
+        info "No Compose-managed volumes detected — skipping."
+        return
+    fi
+
+    info "Compose-managed volumes: ${compose_vols[*]}"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        if [[ -n "$COMPOSE_FILE" ]]; then
+            info "[dry-run] docker compose -f $COMPOSE_FILE up --no-start"
+        else
+            info "[dry-run] Would prompt user to run: docker compose up --no-start"
+        fi
+        return
+    fi
+
+    if [[ -n "$COMPOSE_FILE" ]]; then
+        if [[ ! -f "$COMPOSE_FILE" ]]; then
+            warn "COMPOSE_FILE='$COMPOSE_FILE' not found — skipping auto-registration."
+            warn "Run 'docker compose up --no-start' from your project directory manually."
+            return
+        fi
+        info "Running: docker compose -f $COMPOSE_FILE up --no-start"
+        # 'up --no-start' creates volume metadata (pointing to existing _data)
+        # without starting any container.  Data already in _data is preserved.
+        docker compose -f "$COMPOSE_FILE" up --no-start 2>&1 | sed 's/^/    /'
+        ok "Compose volumes registered — Compose now owns their metadata."
+    else
+        warn "COMPOSE_FILE is not set."
+        warn "The following volumes need to be registered by Compose before 'docker compose up -d':"
+        for vol in "${compose_vols[@]}"; do
+            echo "    $vol"
+        done
+        warn "Run the following from your Compose project directory:"
+        echo "    docker compose up --no-start"
+        echo ""
+        warn "This lets Compose create volume metadata pointing to the already-migrated _data,"
+        warn "so that 'docker compose up -d' does not fail with 'volume was not created by Compose'."
+    fi
 }
 
 # ===========================================================================
@@ -673,7 +759,13 @@ print_summary() {
     echo "     namespace starts with an empty image store):"
     echo "       docker compose pull"
     echo ""
-    echo "  2. Start your services:"
+    if [[ -n "$COMPOSE_FILE" ]]; then
+        echo "  2. Start your services (Compose volumes already registered):"
+    else
+        echo "  2. Register Compose volumes first (if not done automatically):"
+        echo "       docker compose up --no-start"
+        echo "     Then start your services:"
+    fi
     echo "       docker compose up -d"
     echo ""
     echo "  3. Confirm the uid_map of a running container:"
@@ -708,6 +800,7 @@ main() {
     backup_volumes
     configure_and_restart
     migrate_volumes
+    register_compose_volumes
     migrate_bind_mounts
     verify
     print_summary
